@@ -305,6 +305,7 @@ def main(config_path):
             s_dur = torch.stack(ss).squeeze()  # global prosodic styles
             gs = torch.stack(gs).squeeze() # global acoustic styles
             s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
+            s_trg = torch.nan_to_num(s_trg, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
             bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
             d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
@@ -314,8 +315,10 @@ def main(config_path):
                 num_steps = np.random.randint(3, 5)
                 
                 if model_params.diffusion.dist.estimate_sigma_data:
-                    model.diffusion.module.diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
-                    running_std.append(model.diffusion.module.diffusion.sigma_data)
+                    sigma_val = s_trg.std(axis=-1).mean().item()
+                    if np.isfinite(sigma_val) and sigma_val > 0:
+                        model.diffusion.module.diffusion.sigma_data = sigma_val
+                        running_std.append(sigma_val)
                     
                 if multispeaker:
                     s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
@@ -333,7 +336,9 @@ def main(config_path):
                              embedding_mask_proba=0.1,
                              num_steps=num_steps).squeeze(1)                    
                     loss_diff = model.diffusion.module.diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
+                    loss_diff = torch.nan_to_num(loss_diff, nan=0.0, posinf=100.0, neginf=0.0)
                     loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
+                    loss_sty = torch.nan_to_num(loss_sty, nan=0.0, posinf=100.0, neginf=0.0)
             else:
                 loss_sty = 0
                 loss_diff = 0
@@ -376,9 +381,17 @@ def main(config_path):
             if gt.size(-1) < 80:
                 continue
 
+            # 原始音频含 NaN/Inf（数据异常或 decoder 冷启动）时跳过
+            if torch.isnan(wav).any() or torch.isinf(wav).any():
+                logger.warning(f'Corrupt wav at step {i+1}, skipping batch.')
+                continue
+
             s_dur = model.predictor_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
             s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
-            
+            # style vector 极端值保护（来自 decoder 冷启动时的异常 mel）
+            s     = torch.nan_to_num(s,     nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+            s_dur = torch.nan_to_num(s_dur, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+
             with torch.no_grad():
                 F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
                 F0 = F0.reshape(F0.shape[0], F0.shape[1] * 2, F0.shape[2], 1).squeeze()
@@ -386,7 +399,7 @@ def main(config_path):
                 asr_real = model.text_aligner.get_feature(gt)
 
                 N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
-                
+
                 y_rec_gt = wav.unsqueeze(1)
                 y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
 
@@ -394,12 +407,39 @@ def main(config_path):
                     # ground truth from recording
                     wav = y_rec_gt # use recording since decoder is tuned
                 else:
-                    # ground truth from reconstruction
-                    wav = y_rec_gt_pred # use reconstruction since decoder is fixed
+                    # Stage 2 早期 decoder 未收敛，用真实录音避免冷启动死循环
+                    y_rec_gt_pred_valid = torch.isfinite(y_rec_gt_pred).all()
+                    wav = y_rec_gt_pred if y_rec_gt_pred_valid else y_rec_gt
 
             F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
 
+            # ── NaN 诊断 ──
+            def _has_nan(t, name):
+                if isinstance(t, torch.Tensor) and (torch.isnan(t).any() or torch.isinf(t).any()):
+                    valid = t[torch.isfinite(t)]
+                    vmin = valid.min().item() if valid.numel() > 0 else float('nan')
+                    vmax = valid.max().item() if valid.numel() > 0 else float('nan')
+                    print(f"[NaN-DIAG] {name}: shape={list(t.shape)} nan={torch.isnan(t).sum().item()} inf={torch.isinf(t).sum().item()} finite_min={vmin:.4f} finite_max={vmax:.4f}", flush=True)
+                    return True
+                return False
+
+            _has_nan(en,      "en")
+            _has_nan(p_en,    "p_en")
+            _has_nan(s_dur,   "s_dur")
+            _has_nan(s,       "s")
+            _has_nan(F0_real, "F0_real")
+            _has_nan(N_real,  "N_real")
+            _has_nan(F0_fake, "F0_fake")
+            _has_nan(N_fake,  "N_fake")
+            # decoder 输入值域诊断（只在前5步打印，避免刷屏）
+            if i <= 5:
+                print(f"[DIAG-decoder-in] en={en.shape} min={en.min():.3f} max={en.max():.3f} | "
+                      f"F0 min={F0_fake.min():.3f} max={F0_fake.max():.3f} | "
+                      f"N min={N_fake.min():.3f} max={N_fake.max():.3f} | "
+                      f"s min={s.min():.3f} max={s.max():.3f}", flush=True)
+
             y_rec = model.decoder(en, F0_fake, N_fake, s)
+            _has_nan(y_rec,   "y_rec(decoder output)")
 
             loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
             loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
@@ -417,23 +457,37 @@ def main(config_path):
             optimizer.zero_grad()
 
             loss_mel = stft_loss(y_rec, wav)
+            _has_nan(loss_mel, "loss_mel")
             if start_ds:
                 loss_gen_all = gl(wav, y_rec).mean()
             else:
                 loss_gen_all = 0
-            loss_lm = wl(wav.detach().squeeze(), y_rec.squeeze()).mean()
+            # 保证传入 wl 的音频是 [batch, time] 格式，避免 squeeze 压掉 batch 维
+            wav_wl = wav.detach()
+            if wav_wl.dim() == 3:
+                wav_wl = wav_wl.squeeze(1)
+            y_rec_wl = y_rec
+            if y_rec_wl.dim() == 3:
+                y_rec_wl = y_rec_wl.squeeze(1)
+            _has_nan(wav_wl,   "wav_wl (入wl前)")
+            _has_nan(y_rec_wl, "y_rec_wl (入wl前)")
+            loss_lm = wl(wav_wl, y_rec_wl).mean()
+            _has_nan(loss_lm,  "loss_lm")
 
             loss_ce = 0
             loss_dur = 0
             for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), input_lengths):
                 _s2s_pred = _s2s_pred[:_text_length, :]
+                # BCE 要求 logit 有界，clamp 防止 LSTM 初期输出爆炸
+                _s2s_pred = _s2s_pred.clamp(min=-20.0, max=20.0)
+
                 _text_input = _text_input[:_text_length].long()
                 _s2s_trg = torch.zeros_like(_s2s_pred)
                 for p in range(_s2s_trg.shape[0]):
                     _s2s_trg[p, :_text_input[p]] = 1
                 _dur_pred = torch.sigmoid(_s2s_pred).sum(axis=1)
 
-                loss_dur += F.l1_loss(_dur_pred[1:_text_length-1], 
+                loss_dur += F.l1_loss(_dur_pred[1:_text_length-1],
                                        _text_input[1:_text_length-1])
                 loss_ce += F.binary_cross_entropy_with_logits(_s2s_pred.flatten(), _s2s_trg.flatten())
 
@@ -450,11 +504,21 @@ def main(config_path):
                      loss_params.lambda_sty * loss_sty + \
                      loss_params.lambda_diff * loss_diff
 
+            # ── NaN/Inf 最终防线：g_loss 汇总后再检查一次 ──
+            if torch.isnan(g_loss) or torch.isinf(g_loss):
+                logger.warning(f"NaN/Inf in g_loss at Epoch [{epoch+1}], Step [{i+1}] "
+                               f"(mel={loss_mel:.4f}, lm={loss_lm:.4f}, ce={loss_ce:.4f}). Skipping batch.")
+                optimizer.zero_grad()
+                continue
+
             running_loss += loss_mel.item()
             g_loss.backward()
-            if torch.isnan(g_loss):
-                from IPython.core.debugger import set_trace
-                set_trace()
+
+            # ── 梯度裁剪：防止梯度爆炸传播到权重 ──
+            torch.nn.utils.clip_grad_norm_(
+                [p for key in model.keys() for p in model[key].parameters()],
+                max_norm=10.0
+            )
 
             optimizer.step('bert_encoder')
             optimizer.step('bert')
