@@ -21,7 +21,9 @@ class AdaIN1d(nn.Module):
         h = self.fc(s)
         h = h.view(h.size(0), h.size(1), 1)
         gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        return (1 + gamma) * self.norm(x) + beta
+        x_norm = self.norm(x)
+        x_norm = torch.nan_to_num(x_norm, nan=0.0, posinf=1e4, neginf=-1e4)
+        return (1 + gamma) * x_norm + beta
 
 class AdaINResBlock1(torch.nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5), style_dim=64):
