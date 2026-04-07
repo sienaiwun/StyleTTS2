@@ -22,7 +22,8 @@ class AdaIN1d(nn.Module):
         h = self.fc(s)
         h = h.view(h.size(0), h.size(1), 1)
         gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        return (1 + gamma) * self.norm(x) + beta
+        # InstanceNorm 在通道方差=0时除以零产生 NaN，替换为 0
+        return (1 + gamma) * torch.nan_to_num(self.norm(x), nan=0.0) + beta
 
 class AdaINResBlock1(torch.nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5), style_dim=64):
@@ -375,7 +376,7 @@ class Generator(torch.nn.Module):
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
         x = self.conv_post(x)
-        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
+        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :].clamp(-87.0, 87.0))
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
         return self.stft.inverse(spec, phase)
     
@@ -393,7 +394,7 @@ class Generator(torch.nn.Module):
         x = F.leaky_relu(x)
         x = self.reflection_pad(x)
         x = self.conv_post(x)
-        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
+        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :].clamp(-87.0, 87.0))
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
         return spec, phase
 

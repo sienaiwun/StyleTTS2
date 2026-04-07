@@ -278,7 +278,8 @@ def main(config_path):
                 loss_mono = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
                     
                 loss_gen_all = gl(wav.detach().unsqueeze(1).float(), y_rec).mean()
-                loss_slm = wl(wav.detach(), y_rec).mean()
+                with torch.no_grad():  # WavLM 特征提取不需要梯度，大幅减少显存
+                    loss_slm = wl(wav.detach(), y_rec.detach()).mean()
                 
                 g_loss = loss_params.lambda_mel * loss_mel + \
                 loss_params.lambda_mono * loss_mono + \

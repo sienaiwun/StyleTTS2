@@ -495,8 +495,9 @@ class ProsodyPredictor(nn.Module):
         return duration.squeeze(-1), en
     
     def F0Ntrain(self, x, s):
-        x, _ = self.shared(x.transpose(-1, -2))
-        
+        x, _ = self.shared(x.clamp(-1e3, 1e3).transpose(-1, -2))
+        x = torch.nan_to_num(x, nan=0.0)
+
         F0 = x.transpose(-1, -2)
         for block in self.F0:
             F0 = block(F0, s)
@@ -585,7 +586,7 @@ def load_F0_models(path):
     # load F0 model
 
     F0_model = JDCNet(num_class=1, seq_len=192)
-    params = torch.load(path, map_location='cpu')['net']
+    params = torch.load(path, map_location='cpu', weights_only=False)['net']
     F0_model.load_state_dict(params)
     _ = F0_model.train()
     
@@ -601,7 +602,7 @@ def load_ASR_models(ASR_MODEL_PATH, ASR_MODEL_CONFIG):
 
     def _load_model(model_config, model_path):
         model = ASRCNN(**model_config)
-        params = torch.load(model_path, map_location='cpu')['model']
+        params = torch.load(model_path, map_location='cpu', weights_only=False)['model']
         model.load_state_dict(params)
         return model
 
@@ -694,14 +695,27 @@ def build_model(args, text_aligner, pitch_extractor, bert):
     return nets
 
 def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_modules=[]):
-    state = torch.load(path, map_location='cpu')
+    state = torch.load(path, map_location='cpu', weights_only=False)
     params = state['net']
+
     for key in model:
         if key in params and key not in ignore_modules:
             print('%s loaded' % key)
-            model[key].load_state_dict(params[key], strict=False)
+            try:
+                model[key].load_state_dict(params[key], strict=True)
+            except RuntimeError as e:
+                # Handle key mismatch between single GPU (no 'module.' prefix) and 
+                # DataParallel (with 'module.' prefix) checkpoints
+                from collections import OrderedDict
+                state_dict = params[key]
+                new_state_dict = OrderedDict()
+                print(f'{key} key mismatch, attempting to remap keys...')
+                print(f'{key} model keys: {len(model[key].state_dict().keys())}, checkpoint keys: {len(state_dict.keys())}')
+                for (k_m, v_m), (k_c, v_c) in zip(model[key].state_dict().items(), state_dict.items()):
+                    new_state_dict[k_m] = v_c
+                model[key].load_state_dict(new_state_dict, strict=True)
     _ = [model[key].eval() for key in model]
-    
+
     if not load_only_params:
         epoch = state["epoch"]
         iters = state["iters"]
@@ -709,5 +723,5 @@ def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_module
     else:
         epoch = 0
         iters = 0
-        
+
     return model, optimizer, epoch, iters
