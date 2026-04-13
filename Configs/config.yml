@@ -4,7 +4,7 @@ save_freq: 2
 log_interval: 10
 device: "cuda"
 epochs_1st: 60   # [优化] 原200 → 60，RTX 4080 约需 10~12 小时；流程验证够用，音质偏弱
-epochs_2nd: 40   # 30 → 40，多训练 10 个 epoch（从 epoch 28 继续到 40）
+epochs_2nd: 80   # 30 → 80，补充训练（当前从 epoch 29 继续到 80）
 batch_size: 2    # WavLM TMA阶段显存峰值大，降到2确保不OOM
 max_len: 200     # 原400 → 200帧（≈2.5秒），iSTFT vocoder fp32 显存瓶颈
 pretrained_model: "Models/LJSpeech/epoch_2nd_00028.pth"  # 从第二阶段 epoch 28 续训
@@ -19,7 +19,7 @@ PLBERT_dir: 'Utils/PLBERT/'
 data_params:
   train_data: "Data/train_list.txt"
   val_data: "Data/val_list.txt"
-  root_path: "/home/naiwen/StyleTTS2/LJSpeech-1.1/wavs"
+  root_path: "/home/spliced1/StyleTTS2/LJSpeech-1.1/wavs"
   OOD_data: "Data/OOD_texts.txt"
   min_length: 50 # sample until texts with this size are obtained for OOD texts
 

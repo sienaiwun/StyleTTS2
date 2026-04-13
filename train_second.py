@@ -29,6 +29,14 @@ from utils import *
 from Modules.slmadv import SLMAdversarialLoss
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
 
+import phonemizer
+import soundfile as sf
+from nltk.tokenize import word_tokenize
+from text_utils import TextCleaner
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 from optimizers import build_optimizer
 
 # simple fix for dataparallel that allows access to class attributes
@@ -381,6 +389,11 @@ def main(config_path):
             if gt.size(-1) < 80:
                 continue
 
+            # 原始音频含 NaN/Inf（数据异常或 decoder 冷启动）时跳过
+            if torch.isnan(wav).any() or torch.isinf(wav).any():
+                logger.warning(f'Corrupt wav at step {i+1}, skipping batch.')
+                continue
+
             s_dur = model.predictor_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
             s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
             # style vector 极端值保护（来自 decoder 冷启动时的异常 mel）
@@ -550,6 +563,13 @@ def main(config_path):
                     
                 d_loss_slm, loss_gen_lm, y_pred = slm_out
                 
+                # SLM NaN 保护
+                if torch.isnan(loss_gen_lm).any() or torch.isinf(loss_gen_lm).any():
+                    logger.warning(f'  ⚠️ SLM GenLM loss is NaN/Inf at step {i}, skipping SLM update')
+                    optimizer.zero_grad()
+                    d_loss_slm, loss_gen_lm = 0, 0
+                    continue
+                
                 # SLM generator loss
                 optimizer.zero_grad()
                 loss_gen_lm.backward()
@@ -590,9 +610,12 @@ def main(config_path):
 
                 # SLM discriminator loss
                 if d_loss_slm != 0:
-                    optimizer.zero_grad()
-                    d_loss_slm.backward(retain_graph=True)
-                    optimizer.step('wd')
+                    if torch.is_tensor(d_loss_slm) and (torch.isnan(d_loss_slm).any() or torch.isinf(d_loss_slm).any()):
+                        logger.warning(f'  ⚠️ SLM DiscLM loss is NaN/Inf at step {i}, skipping disc update')
+                    else:
+                        optimizer.zero_grad()
+                        d_loss_slm.backward(retain_graph=True)
+                        optimizer.step('wd')
 
             else:
                 d_loss_slm, loss_gen_lm = 0, 0
@@ -839,6 +862,94 @@ def main(config_path):
             }
             save_path = osp.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
             torch.save(state, save_path)
+
+            # ── 自动生成 Hello World 语音和 mel 频谱图 ──
+            try:
+                _ = [model[key].eval() for key in model]
+                
+                # 初始化 phonemizer 和 text cleaner（只初始化一次）
+                if not hasattr(main, '_phonemizer'):
+                    main._phonemizer = phonemizer.backend.EspeakBackend(
+                        language='en-us', preserve_punctuation=True, with_stress=True)
+                    main._textcleaner = TextCleaner()
+                
+                demo_text = "Hello world"
+                ps = main._phonemizer.phonemize([demo_text])
+                ps = word_tokenize(ps[0])
+                ps = ' '.join(ps)
+                
+                tokens = main._textcleaner(ps)
+                tokens.insert(0, 0)
+                tokens = torch.LongTensor(tokens).to(device).unsqueeze(0)
+                
+                with torch.no_grad():
+                    input_lengths = torch.LongTensor([tokens.shape[-1]]).to(device)
+                    text_mask = length_to_mask(input_lengths).to(device)
+                    
+                    t_en = model.text_encoder(tokens, input_lengths, text_mask)
+                    bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
+                    d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+                    
+                    noise = torch.randn(1, 1, 256).to(device)
+                    s_pred = sampler(noise,
+                                     embedding=bert_dur[0].unsqueeze(0),
+                                     num_steps=5, embedding_scale=1).squeeze(0)
+                    
+                    s = s_pred[:, 128:]
+                    ref = s_pred[:, :128]
+                    
+                    d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+                    x, _ = model.predictor.lstm(d)
+                    duration = model.predictor.duration_proj(x)
+                    duration = torch.sigmoid(duration).sum(axis=-1)
+                    pred_dur = torch.round(duration.squeeze()).clamp(min=1)
+                    pred_dur[-1] += 5
+                    
+                    pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
+                    c_frame = 0
+                    for ii in range(pred_aln_trg.size(0)):
+                        pred_aln_trg[ii, c_frame:c_frame + int(pred_dur[ii].data)] = 1
+                        c_frame += int(pred_dur[ii].data)
+                    
+                    en = (d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(device))
+                    F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+                    aln_en = t_en @ pred_aln_trg.unsqueeze(0).to(device)
+                    out = model.decoder(aln_en, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+                
+                wav_out = out.squeeze().cpu().numpy()
+                
+                # 归一化
+                max_val = np.abs(wav_out).max()
+                if max_val > 1.0:
+                    wav_out = wav_out / max_val * 0.95
+                
+                # 保存音频
+                demo_wav_path = osp.join(log_dir, f'demo_epoch_{epoch:05d}.wav')
+                sf.write(demo_wav_path, wav_out, 24000)
+                
+                # 保存 mel 频谱图
+                mel_transform = torchaudio.transforms.MelSpectrogram(
+                    sample_rate=24000, n_mels=80, n_fft=2048, win_length=1200, hop_length=300)
+                mel_spec = mel_transform(torch.from_numpy(wav_out).float())
+                mel_db = torch.log(mel_spec + 1e-5)
+                
+                fig, ax = plt.subplots(figsize=(12, 4))
+                ax.imshow(mel_db.numpy(), aspect='auto', origin='lower', cmap='magma')
+                ax.set_title(f'Epoch {epoch} - "Hello world" (dur={pred_dur.tolist()})')
+                ax.set_xlabel('Frame')
+                ax.set_ylabel('Mel Channel')
+                plt.tight_layout()
+                mel_path = osp.join(log_dir, f'demo_mel_epoch_{epoch:05d}.png')
+                fig.savefig(mel_path, dpi=150)
+                plt.close(fig)
+                
+                # 写入 tensorboard
+                writer.add_audio('demo/hello_world', wav_out, epoch, sample_rate=24000)
+                
+                logger.info(f'  📢 Demo saved: {demo_wav_path} (dur={pred_dur.tolist()}, peak={max_val:.2f})')
+                
+            except Exception as e:
+                logger.warning(f'  ⚠️ Demo generation failed: {e}')
             
             # if estimate sigma, save the estimated simga
             if model_params.diffusion.dist.estimate_sigma_data:
