@@ -3,11 +3,11 @@ first_stage_path: "first_stage.pth"
 save_freq: 2
 log_interval: 10
 device: "cuda"
-epochs_1st: 200 # number of epochs for first stage training (pre-training)
-epochs_2nd: 100 # number of peochs for second stage training (joint training)
-batch_size: 16
-max_len: 400 # maximum number of frames
-pretrained_model: ""
+epochs_1st: 60   # [优化] 原200 → 60，RTX 4080 约需 10~12 小时；流程验证够用，音质偏弱
+epochs_2nd: 80   # [优化] 原100 → 30，RTX 4080 约需 9~12 小时；WavLM对抗仅15轮，音质有损
+batch_size: 4    # WavLM TMA阶段显存峰值大，降到16确保不OOM
+max_len: 200     # 原400 → 200帧（≈2.5秒），iSTFT vocoder fp32 显存瓶颈
+pretrained_model: "Models/LJSpeech/epoch_2nd_00048.pth"
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: false # set to true if do not want to load epoch numbers and optimizer parameters
 
@@ -19,7 +19,7 @@ PLBERT_dir: 'Utils/PLBERT/'
 data_params:
   train_data: "Data/train_list.txt"
   val_data: "Data/val_list.txt"
-  root_path: "/local/LJSpeech-1.1/wavs"
+  root_path: "/home/spliced1/StyleTTS2/LJSpeech-1.1/wavs"
   OOD_data: "Data/OOD_texts.txt"
   min_length: 50 # sample until texts with this size are obtained for OOD texts
 
@@ -88,7 +88,7 @@ loss_params:
     
     lambda_mono: 1. # monotonic alignment loss (1st stage, TMA)
     lambda_s2s: 1. # sequence-to-sequence loss (1st stage, TMA)
-    TMA_epoch: 50 # TMA starting epoch (1st stage)
+    TMA_epoch: 15  # [优化] 原50 → 15（对应 epochs_1st=60 的 25%，比例保持 25%
 
     lambda_F0: 1. # F0 reconstruction loss (2nd stage)
     lambda_norm: 1. # norm reconstruction loss (2nd stage)
@@ -97,8 +97,8 @@ loss_params:
     lambda_sty: 1. # style reconstruction loss (2nd stage)
     lambda_diff: 1. # score matching loss (2nd stage)
     
-    diff_epoch: 20 # style diffusion starting epoch (2nd stage)
-    joint_epoch: 50 # joint training starting epoch (2nd stage)
+    diff_epoch: 6   # [优化] 原20 → 6（对应 epochs_2nd=30 的 20%，比例保持 20%）
+    joint_epoch: 15 # [优化] 原50 → 15（对应 epochs_2nd=30 的 50%，比例保持 50%）
 
 optimizer_params:
   lr: 0.0001 # general learning rate
