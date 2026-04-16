@@ -7,9 +7,10 @@ set -e
 
 # ---- 配置 ----
 PROJECT_DIR="$HOME/StyleTTS2"
-DATA_DIR="$HOME/LibriTTS"
+DATA_DIR="/mnt/d/LibriTTS"
 VENV_DIR="$HOME/styletts2_env/venv"
 NUM_WORKERS=4
+VAL_SPEAKER_RATIO=0.1  # 10% 说话人用于验证
 
 echo "============================================"
 echo " StyleTTS2 LibriTTS Multi-Speaker Training"
@@ -31,9 +32,9 @@ echo "[Step 1] Downloading LibriTTS dataset..."
 mkdir -p "$DATA_DIR"
 cd "$DATA_DIR"
 
-# 下载 train-clean-100 和 train-clean-360 (约 30GB)
-# dev-clean 作为验证集
-SUBSETS=("train-clean-100" "train-clean-360" "dev-clean")
+# 只下载 train-clean-100 (约 8.6GB)
+# 训练/验证集从中按 speaker 切分
+SUBSETS=("train-clean-100")
 
 for subset in "${SUBSETS[@]}"; do
     TAR_FILE="${subset}.tar.gz"
@@ -115,9 +116,8 @@ def process_subset(subset_name, wav_paths, texts, speaker_ids):
             continue
     return results
 
-# 收集所有 train 子集
-train_subsets = ['train-clean-100', 'train-clean-360']
-val_subsets = ['dev-clean']
+# 只使用 train-clean-100，后续按 speaker 切分 train/val
+all_subsets = ['train-clean-100']
 
 def collect_data(subsets):
     wav_paths = []
@@ -179,25 +179,42 @@ def collect_data(subsets):
 
     return wav_paths, texts, speaker_ids, speaker_map
 
-print('Collecting training data...')
-train_wavs, train_texts, train_spks, speaker_map = collect_data(train_subsets)
-print(f'  Training: {len(train_wavs)} utterances, {len(set(train_spks))} speakers')
+print('Collecting all data...')
+all_wavs, all_texts, all_spks, speaker_map = collect_data(all_subsets)
+print(f'  Total: {len(all_wavs)} utterances, {len(set(all_spks))} speakers')
 
-print('Collecting validation data...')
-val_wavs, val_texts, val_spks, _ = collect_data(val_subsets)
-# 重新映射 val speaker IDs
-val_speaker_map = {}
-for i, spk in enumerate(val_spks):
-    orig_spk_dir = [k for k, v in speaker_map.items() if v == spk]
-    if orig_spk_dir:
-        val_spks[i] = speaker_map.get(orig_spk_dir[0], spk)
-print(f'  Validation: {len(val_wavs)} utterances')
+print('\\nPhonemerizing all data...')
+all_results = process_subset('all', all_wavs, all_texts, all_spks)
 
-print('\\nPhonemerizing training data...')
-train_results = process_subset('train', train_wavs, train_texts, train_spks)
+# 按 speaker 切分 train/val (10% speaker 做验证)
+import random
+random.seed(42)
 
-print('Phonemerizing validation data...')
-val_results = process_subset('val', val_wavs, val_texts, val_spks)
+speakers_data = {}
+for line in all_results:
+    spk = line.split('|')[2]
+    if spk not in speakers_data:
+        speakers_data[spk] = []
+    speakers_data[spk].append(line)
+
+spk_ids = list(speakers_data.keys())
+random.shuffle(spk_ids)
+val_spk_count = max(int(len(spk_ids) * 0.1), 5)
+val_spks = set(spk_ids[:val_spk_count])
+
+train_results = []
+val_results = []
+for spk, utts in speakers_data.items():
+    if spk in val_spks:
+        val_results.extend(utts)
+    else:
+        train_results.extend(utts)
+
+random.shuffle(train_results)
+random.shuffle(val_results)
+
+print(f'  Train: {len(train_results)} utterances ({len(spk_ids) - val_spk_count} speakers)')
+print(f'  Val:   {len(val_results)} utterances ({val_spk_count} speakers)')
 
 # 保存
 os.makedirs(os.path.join(PROJECT_DIR, 'Data'), exist_ok=True)
