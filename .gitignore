@@ -1,1 +1,13 @@
 __pycache__
+
+# ONNX export outputs
+*.onnx
+*.wav
+sherpa_resources/voices.bin
+onnx_models/
+Models/
+
+# Debug outputs
+debug_*.wav
+test_*.wav
+verify_*.wav

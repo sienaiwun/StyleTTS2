@@ -694,6 +694,7 @@ def build_model(args, text_aligner, pitch_extractor, bert):
     
     return nets
 
+
 def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_modules=[]):
     state = torch.load(path, map_location='cpu', weights_only=False)
     params = state['net']

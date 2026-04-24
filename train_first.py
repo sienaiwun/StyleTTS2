@@ -83,7 +83,7 @@ def main(config_path):
                                         OOD_data=OOD_data,
                                         min_length=min_length,
                                         batch_size=batch_size,
-                                        num_workers=2,
+                                        num_workers=0,
                                         dataset_config={},
                                         device=device)
 
@@ -278,8 +278,7 @@ def main(config_path):
                 loss_mono = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
                     
                 loss_gen_all = gl(wav.detach().unsqueeze(1).float(), y_rec).mean()
-                with torch.no_grad():  # WavLM 特征提取不需要梯度，大幅减少显存
-                    loss_slm = wl(wav.detach(), y_rec.detach()).mean()
+                loss_slm = wl(wav.detach(), y_rec).mean()
                 
                 g_loss = loss_params.lambda_mel * loss_mel + \
                 loss_params.lambda_mono * loss_mono + \
